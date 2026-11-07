@@ -18,6 +18,11 @@ from aiogram.types import (
 )
 from google import genai
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@your_channel")
+GEMINI_KEY = os.getenv("GEMINI_KEY")
+
 APP_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 bot = Bot(token=BOT_TOKEN)
