@@ -1,0 +1,4 @@
+feedparser
+google-genai
+aiogram
+aiohttp
