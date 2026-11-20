@@ -32,6 +32,7 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
 from hashlib import sha256
+from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
@@ -42,7 +43,57 @@ DEFAULT_FEEDS = {
     "Jobicy": "https://jobicy.com/jobs/feed?type=contract,freelance",
     "Himalayas": "https://himalayas.app/jobs/api/search?country=KZ&employment_type=Contractor&sort=recent",
 }
-SOURCE_MIN_INTERVALS = {"jobicy.com": 3600, "himalayas.app": 86400}
+TELEGRAM_CHANNELS = (
+    "free_Design1",
+    "webfrl",
+    "digital_partners_chat",
+    "vacancies_in_english",
+    "Freelanceroff",
+    "freelance_jobs_online",
+    "freelancersworldwide",
+    "cashhuntersKZ",
+    "jobkz_1",
+    "remote_kazakhstan",
+    "smm_almaty1",
+    "smm_astana1",
+    "jumystapjobs",
+    "digitaltender",
+    "digitaltalks",
+    "itfreelancers",
+    "outsource456",
+    "devkg",
+    "freelancetaverna",
+    "GetClient",
+    "GetFrilans",
+    "zakaz_design",
+    "motionhunter",
+    "editors_video",
+    "editorspro",
+    "neiro_ai_vacancy",
+    "neiro_ai_chat",
+    "vacancysmm",
+    "textodromo",
+    "translationsTranslators",
+    "freelancebay",
+    "remotejobs4u",
+    "zakazy_it",
+    "designerworkchat",
+    "designwork_vacansii",
+    "design_freevacancies",
+    "vakansii_dlya_dizaynera",
+    "chikchirikbird",
+    "takoyfreelance",
+    "board_axolotl",
+    "diworkru",
+    "freelanceeboom",
+    "work_editor",
+    "tut_zakaz",
+    "freelancevpsmm",
+    "Frilans_Birzha",
+    "rabota_is_doma_vakansii",
+    "zaichenkoteam",
+)
+SOURCE_MIN_INTERVALS = {"jobicy.com": 3600, "himalayas.app": 86400, "t.me": 300}
 EMAIL_PLATFORMS = {
     "kwork.ru": ("Kwork", "https://kwork.ru/projects"),
     "weblancer.net": ("Weblancer", "https://www.weblancer.net/"),
@@ -188,8 +239,72 @@ def store_orders(db, source, feed_url, orders):
     return bool(first_check)
 
 
-async def fetch_feed(session, url):
+class TelegramPreview(HTMLParser):
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel.lower()
+        self.posts = {}
+        self.post = None
+        self.text_depth = 0
+        self.text = []
+
+    def handle_starttag(self, tag, attrs):
+        if self.text_depth:
+            if tag == "div":
+                self.text_depth += 1
+            if tag in {"br", "p", "div"}:
+                self.text.append(" ")
+            return
+        attrs = dict(attrs)
+        if tag != "div":
+            return
+        if "data-post" in attrs:
+            handle, _, message_id = (attrs["data-post"] or "").partition("/")
+            self.post = message_id if handle.lower() == self.channel and message_id.isdecimal() else None
+        if self.post and "tgme_widget_message_text" in attrs.get("class", "").split():
+            self.text_depth = 1
+            self.text = []
+
+    def handle_data(self, data):
+        if self.text_depth:
+            self.text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag != "div" or not self.text_depth:
+            return
+        self.text_depth -= 1
+        if self.text_depth == 0:
+            text = " ".join("".join(self.text).split())
+            if text:
+                link = f"https://t.me/{self.channel}/{self.post}"
+                self.posts[link] = (text[:120], text if len(text) > 120 else "")
+
+
+async def fetch_telegram_preview(session, url):
+    channel = urlsplit(url).path.rsplit("/", 1)[-1]
+    async with session.get(url, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=8)) as response:
+        response.raise_for_status()
+        if response.status != 200:
+            raise ValueError("нет публичной веб-ленты Telegram")
+        body = await response.text()
+    preview = TelegramPreview(channel)
+    preview.feed(body)
+    preview.close()
+    if "tgme_channel_history" not in body and not preview.posts:
+        raise ValueError("нет публичной веб-ленты Telegram")
+    # The existing queue expects newest-first source results.
+    return dict(sorted(preview.posts.items(),
+                       key=lambda item: int(item[0].rsplit("/", 1)[-1]), reverse=True))
+
+
+async def fetch_feed(session, url, telegram_slots=None):
+
     parts = urlsplit(url)
+    if parts.hostname == "t.me" and parts.path.startswith("/s/"):
+        if telegram_slots is None:
+            return await fetch_telegram_preview(session, url)
+        async with telegram_slots:
+            return await fetch_telegram_preview(session, url)
     if parts.hostname == "himalayas.app" and parts.path == "/jobs/api/search":
         async with session.get(url) as response:
             response.raise_for_status()
@@ -265,6 +380,7 @@ async def send_order(session, token, admin_id, order):
 async def poll_sources(session, db, feeds, token, admin_id, interval, mail=None):
     retry_at = 0
     next_poll = {}
+    telegram_slots = asyncio.Semaphore(4)
     clock = asyncio.get_running_loop().time
     while True:
         now = clock()
@@ -272,7 +388,7 @@ async def poll_sources(session, db, feeds, token, admin_id, interval, mail=None)
         for _, url in due:
             host = (urlsplit(url).hostname or "").removeprefix("www.")
             next_poll[url] = now + max(interval, SOURCE_MIN_INTERVALS.get(host, 0))
-        results = await asyncio.gather(*(fetch_feed(session, url) for _, url in due),
+        results = await asyncio.gather(*(fetch_feed(session, url, telegram_slots) for _, url in due),
                                        return_exceptions=True)
         for (source, url), result in zip(due, results):
             if isinstance(result, Exception):
@@ -332,6 +448,7 @@ async def main():
         and urlsplit(url).netloc for url in feeds.values()
     ):
         raise SystemExit("RSS_FEEDS должен содержать названия площадок и HTTP(S)-адреса RSS/Atom.")
+    feeds = {**feeds, **{f"Telegram @{name}": f"https://t.me/s/{name}" for name in TELEGRAM_CHANNELS}}
     interval = max(30, int(os.environ.get("POLL_SECONDS", "120")))
     mail = tuple(os.getenv(key) for key in
                  ("IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD", "IMAP_FOLDER"))
