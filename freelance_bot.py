@@ -103,6 +103,39 @@ EMAIL_PLATFORMS = {
 }
 LOG = logging.getLogger("freelance_bot")
 
+HIRING = re.compile(
+    r"\b(?:ищем|ищу|нуж(?:ен|на|ны|но)|требу(?:ется|ются)|"
+    r"ваканси[яию]|нанимаем|открыта\s+позиция|looking\s+for|"
+    r"hiring|wanted|job\s+opening|seeking|we\s+need)\b|"
+    r"#(?:заказ|проект|вакансия)\b",
+    re.IGNORECASE,
+)
+WORK_AREAS = re.compile(
+    r"\b(?:сайт\w*|лендинг\w*|в[еэ]б\w*|верст\w*|разработ\w*|"
+    r"программист\w*|приложени\w*|телеграм[- ]бот\w*|бот\w*|"
+    r"автоматизаци\w*|интеграци\w*|дизайн\w*|график\w*|"
+    r"иллюстратор\w*|моуш[еэ]н\w*|монтаж\w*|видеомонтаж\w*|"
+    r"видео\w*|анимаци\w*|ретуш\w*|моделировани\w*|"
+    r"python|java|javascript|typescript|react|wordpress|tilda|figma|"
+    r"front[- ]?end|back[- ]?end|full[- ]?stack|web\w*|developer\w*|"
+    r"design\w*|video|editor\w*|motion|3[дd]|ui|ux|1[сc]|"
+    r"smm|смм|нейросет\w*|ai[- ](?:video|designer|developer))\b",
+    re.IGNORECASE,
+)
+SELF_PROMOTION = re.compile(
+    r"\b(?:ищу\s+(?:работу|заказы|клиентов|подработку|проект(?:ы|ов)?)|"
+    r"предлагаю\s+(?:услуги|свои\s+услуги)|возьму\s+(?:заказ|проект)|"
+    r"открыт[аы]?\s+к\s+(?:работе|проектам)|"
+    r"подписывайтесь\s+на\s+(?:наш|мой)\s+канал|"
+    r"looking\s+for\s+(?:work|clients|projects)|available\s+for\s+(?:work|hire))\b|"
+    r"\[\s*for\s+hire\s*\]|#(?:ищуработу|резюме|самореклама)\b",
+    re.IGNORECASE,
+)
+
+
+def is_telegram_order(text):
+    return bool(HIRING.search(text) and WORK_AREAS.search(text) and not SELF_PROMOTION.search(text))
+
 
 def plain_text(value):
     return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())
@@ -406,6 +439,11 @@ async def poll_sources(session, db, feeds, token, admin_id, interval, mail=None)
                    WHERE delivered = 0 ORDER BY seq"""
             ).fetchall()
             for order in pending:
+                _, _, source, title, description = order
+                if source.startswith("Telegram @") and not is_telegram_order(description or title):
+                    with db:
+                        db.execute("UPDATE orders SET delivered = 1 WHERE seq = ?", (order[0],))
+                    continue
                 try:
                     delivered, delay = await send_order(session, token, admin_id, order)
                 except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
