@@ -48,7 +48,7 @@ EMAIL_PLATFORMS = {
 }
 LOG = logging.getLogger("freelance_bot")
 
-
+ 
 def plain_text(value):
     return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())
 
