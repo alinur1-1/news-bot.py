@@ -13,6 +13,7 @@
   Создайте правила почты, которые складывают туда нужные письма площадок.
   EMAIL_BOOTSTRAP — необязательно: 1, чтобы также отправить последние 100 писем.
   PORT — порт HTTP-проверки состояния для хостинга, по умолчанию 8080.
+  RENDER_EXTERNAL_URL — публичный URL Render для самопинга каждые 14 минут.
 Запускайте один экземпляр и храните SQLite на постоянном диске.
 """
 
@@ -48,7 +49,7 @@ EMAIL_PLATFORMS = {
 }
 LOG = logging.getLogger("freelance_bot")
 
- 
+
 def plain_text(value):
     return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())
 
@@ -285,6 +286,19 @@ async def handle_ping(_request):
     return web.Response(text="OK")
 
 
+async def keepalive(session, public_url):
+    url = public_url.rstrip("/") + "/"
+    while True:
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                await response.read()
+                LOG.info("Самопинг Render: HTTP %s.", response.status)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            LOG.warning("Самопинг Render не удался (%s).", type(error).__name__)
+        await asyncio.sleep(14 * 60)
+
+
 async def main():
     token = os.environ.get("BOT_TOKEN")
     admin_id = int(os.environ.get("ADMIN_ID", "0"))
@@ -311,7 +325,14 @@ async def main():
         with closing(sqlite3.connect(os.environ.get("DB_PATH", "freelance.sqlite3"))) as db:
             initialize_db(db)
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-                await poll_sources(session, db, feeds, token, admin_id, interval, mail if all(mail) else None)
+                public_url = os.getenv("RENDER_EXTERNAL_URL")
+                ping_task = asyncio.create_task(keepalive(session, public_url)) if public_url else None
+                try:
+                    await poll_sources(session, db, feeds, token, admin_id, interval, mail if all(mail) else None)
+                finally:
+                    if ping_task:
+                        ping_task.cancel()
+                        await asyncio.gather(ping_task, return_exceptions=True)
     finally:
         await runner.cleanup()
 
