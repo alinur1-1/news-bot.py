@@ -6,6 +6,7 @@
   BOT_TOKEN — токен Telegram-бота, задаётся в настройках хостинга.
   ADMIN_ID — числовой Telegram ID получателя. Сначала нажмите Start у бота.
   RSS_FEEDS — необязательный JSON-объект {"Площадка": "https://.../feed.xml"}.
+  В RSS_FEEDS также поддерживается официальный JSON-поиск Himalayas.
   POLL_SECONDS — интервал проверки в секундах, по умолчанию 120 (минимум 30).
   DB_PATH — путь к SQLite, по умолчанию freelance.sqlite3.
   IMAP_HOST, IMAP_USER, IMAP_PASSWORD — необязательное подключение к почте (TLS).
@@ -37,9 +38,11 @@ import aiohttp
 from aiohttp import web
 
 DEFAULT_FEEDS = {
-    "FL.ru": "https://www.fl.ru/rss/all.xml",
     "Freelancehunt": "https://freelancehunt.com/projects.rss",
+    "Jobicy": "https://jobicy.com/jobs/feed?type=contract,freelance",
+    "Himalayas": "https://himalayas.app/jobs/api/search?country=KZ&employment_type=Contractor&sort=recent",
 }
+SOURCE_MIN_INTERVALS = {"jobicy.com": 3600, "himalayas.app": 86400}
 EMAIL_PLATFORMS = {
     "kwork.ru": ("Kwork", "https://kwork.ru/projects"),
     "weblancer.net": ("Weblancer", "https://www.weblancer.net/"),
@@ -186,6 +189,19 @@ def store_orders(db, source, feed_url, orders):
 
 
 async def fetch_feed(session, url):
+    parts = urlsplit(url)
+    if parts.hostname == "himalayas.app" and parts.path == "/jobs/api/search":
+        async with session.get(url) as response:
+            response.raise_for_status()
+            payload = await response.json()
+        orders = {}
+        for job in payload["jobs"]:
+            title = plain_text(job.get("title") or "")
+            link = job.get("applicationLink") or ""
+            if title and urlsplit(link).scheme == "https" and urlsplit(link).hostname:
+                description = plain_text(job.get("excerpt") or "")
+                orders[link] = (title, f"Источник: https://himalayas.app\n{description}")
+        return orders
     async with session.get(url, headers={"Accept": "application/rss+xml, application/atom+xml, */*"}) as response:
         response.raise_for_status()
         return parse_feed(await response.read(), str(response.url))
@@ -248,11 +264,17 @@ async def send_order(session, token, admin_id, order):
 
 async def poll_sources(session, db, feeds, token, admin_id, interval, mail=None):
     retry_at = 0
+    next_poll = {}
     clock = asyncio.get_running_loop().time
     while True:
-        results = await asyncio.gather(*(fetch_feed(session, url) for url in feeds.values()),
+        now = clock()
+        due = [(source, url) for source, url in feeds.items() if now >= next_poll.get(url, 0)]
+        for _, url in due:
+            host = (urlsplit(url).hostname or "").removeprefix("www.")
+            next_poll[url] = now + max(interval, SOURCE_MIN_INTERVALS.get(host, 0))
+        results = await asyncio.gather(*(fetch_feed(session, url) for _, url in due),
                                        return_exceptions=True)
-        for (source, url), result in zip(feeds.items(), results):
+        for (source, url), result in zip(due, results):
             if isinstance(result, Exception):
                 LOG.warning("%s: лента недоступна или некорректна (%s).",
                             source, type(result).__name__)
