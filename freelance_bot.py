@@ -405,7 +405,26 @@ async def send_order(session, token, admin_id, order):
         result = await response.json()
         if not result.get("ok"):
             delay = result.get("parameters", {}).get("retry_after")
-            LOG.warning("Telegram отклонил отправку (HTTP %s).", response.status)
+            reason = str(result.get("description", "")).lower()
+            if response.status == 400 and any(
+                marker in reason for marker in
+                ("button_url_invalid", "wrong http url", "unsupported url protocol")
+            ):
+                LOG.warning("Telegram: недопустимая кнопка у объявления %s. Отправляю ссылку текстом.", order[0])
+                async with session.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": admin_id, "text": f"{message}\n\n{link[:1000]}",
+                          "link_preview_options": {"is_disabled": True}},
+                ) as fallback:
+                    fallback_result = await fallback.json()
+                if fallback_result.get("ok"):
+                    return True, None
+                response_status = fallback.status
+                delay = fallback_result.get("parameters", {}).get("retry_after")
+            else:
+                response_status = response.status
+            LOG.warning("Telegram отклонил отправку объявления %s из %s (HTTP %s).",
+                        order[0], source, response_status)
             return False, delay
         return True, None
 
@@ -438,11 +457,13 @@ async def poll_sources(session, db, feeds, token, admin_id, interval, mail=None)
                 """SELECT seq, url, source, title, description FROM orders
                    WHERE delivered = 0 ORDER BY seq"""
             ).fetchall()
+            sent_count = skipped_count = 0
             for order in pending:
                 _, _, source, title, description = order
                 if source.startswith("Telegram @") and not is_telegram_order(description or title):
                     with db:
                         db.execute("UPDATE orders SET delivered = 1 WHERE seq = ?", (order[0],))
+                    skipped_count += 1
                     continue
                 try:
                     delivered, delay = await send_order(session, token, admin_id, order)
@@ -454,7 +475,10 @@ async def poll_sources(session, db, feeds, token, admin_id, interval, mail=None)
                     break
                 with db:
                     db.execute("UPDATE orders SET delivered = 1 WHERE seq = ?", (order[0],))
+                sent_count += 1
                 await asyncio.sleep(1)
+            LOG.info("Telegram: в очереди было %s, отправлено %s, отсеяно фильтром %s.",
+                     len(pending), sent_count, skipped_count)
         await asyncio.sleep(interval)
 
 
